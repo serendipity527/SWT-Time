@@ -1,0 +1,7 @@
+checkpoints/
+dataset/
+__pycache__/
+*.pyc
+*.sh
+miniconda.sh
+t-Linux-x86_64.sh
