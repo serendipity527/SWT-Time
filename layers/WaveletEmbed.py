@@ -1,41 +1,91 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pywt
 import numpy as np
+
+try:
+    import ptwt
+    from ptwt.stationary_transform import swt as ptwt_swt, iswt as ptwt_iswt
+    import pywt  # 用于验证小波名称
+    PTWT_AVAILABLE = True
+except ImportError:
+    PTWT_AVAILABLE = False
+    import pywt
+    print("Warning: ptwt not available, falling back to slow CPU implementation. Install with: pip install ptwt")
 
 
 class SWTDecomposition(nn.Module):
     """
     平稳小波变换(Stationary Wavelet Transform)分解层
     在 Patching 之前对时间序列进行多尺度分解
+    优化版本：使用 ptwt 进行 GPU 加速的批处理小波变换
     """
     def __init__(self, wavelet='db4', level=3, mode='symmetric'):
         """
         Args:
             wavelet: 小波基，默认 'db4'
             level: 分解层数，默认 3
-            mode: 边界处理模式，默认 'symmetric'
+            mode: 边界处理模式，默认 'symmetric' (ptwt使用'reflect')
         """
         super(SWTDecomposition, self).__init__()
         self.wavelet = wavelet
         self.level = level
-        self.mode = mode
+        # ptwt 使用 'reflect', 'zero', 'constant' 等模式
+        # 将 symmetric 映射到 reflect
+        self.mode = 'reflect' if mode == 'symmetric' else mode
+        self.use_gpu = PTWT_AVAILABLE
         
-        # 验证小波基是否可用
+        # 验证小波名称有效性（GPU 和 CPU 模式都检查）
         if wavelet not in pywt.wavelist():
             raise ValueError(f"Wavelet '{wavelet}' is not available. Choose from {pywt.wavelist()}")
     
     def forward(self, x):
         """
-        前向传播进行 SWT 分解
+        前向传播进行小波分解 (GPU 加速批处理版本)
         
         Args:
             x: 输入张量 (B, N, T) - batch_size, n_vars, seq_len
             
         Returns:
-            coeffs_tensor: 重构后的小波系数张量 (B, N, T, level+1)
-                          包含 [cA3, cD3, cD2, cD1] (对于3层分解)
+            coeffs_tensor: 小波系数张量 (B, N, T, level+1)
+                          包含 [cA_level, cD_level, ..., cD_1]
+        """
+        if self.use_gpu:
+            return self._forward_gpu(x)
+        else:
+            return self._forward_cpu(x)
+    
+    def _forward_gpu(self, x):
+        """
+        GPU 加速版本：使用 ptwt 的 SWT 进行批处理小波变换
+        """
+        B, N, T = x.shape
+        device = x.device
+        dtype = x.dtype
+        
+        # 确保是 float32 (ptwt 要求)
+        if dtype == torch.bfloat16 or dtype == torch.float16:
+            x = x.float()
+        
+        # 重塑为 (B*N, 1, T) 以便批处理
+        x_reshaped = x.reshape(B * N, 1, T)
+        
+        # 使用 ptwt.swt 进行批量平稳小波分解
+        # swt 返回 [cA_n, cD_n, cD_n-1, ..., cD_1]，每个系数长度与原始信号相同
+        coeffs_list = ptwt_swt(x_reshaped, self.wavelet, level=self.level)
+        
+        # coeffs_list 中每个元素形状都是 (B*N, 1, T)
+        # 堆叠并重塑: (level+1, B*N, 1, T) -> (B*N, level+1, T)
+        coeffs_stacked = torch.stack([c.squeeze(1) for c in coeffs_list], dim=1)
+        
+        # 重塑: (B*N, level+1, T) -> (B, N, level+1, T) -> (B, N, T, level+1)
+        coeffs_tensor = coeffs_stacked.reshape(B, N, self.level + 1, T).permute(0, 1, 3, 2)
+        
+        return coeffs_tensor
+    
+    def _forward_cpu(self, x):
+        """
+        CPU 回退版本：使用原始 pywt 实现（保持向后兼容）
         """
         B, N, T = x.shape
         device = x.device
@@ -48,33 +98,26 @@ class SWTDecomposition(nn.Module):
             batch_coeffs = []
             for n in range(N):
                 # 转换到 CPU numpy 进行 SWT
-                # 先转换为 float32，因为 numpy 不支持 bfloat16
                 signal = x[b, n, :].float().cpu().detach().numpy()
                 
                 # 执行 SWT 分解
-                # coeffs 格式: [(cA_n, cD_n), (cA_n-1, cD_n-1), ..., (cA_1, cD_1)]
-                # 对于 level=3: [(cA3, cD3), (cA2, cD2), (cA1, cD1)]
                 coeffs = pywt.swt(signal, wavelet=self.wavelet, level=self.level, 
                                  norm=True)
                 
-                # 提取系数: cA_n, cD_n, cD_n-1, ..., cD_1
-                # 确保每个系数都是一维数组且长度为 T
+                # 提取系数
                 var_coeffs = []
                 
-                # 提取最后一层的近似系数 (低频)
-                cA = np.asarray(coeffs[0][0]).flatten()  # cA3 (最粗尺度的近似系数)
+                # 提取最后一层的近似系数
+                cA = np.asarray(coeffs[0][0]).flatten()
                 var_coeffs.append(cA)
                 
-                # 提取所有层的细节系数 (高频)，从粗到细
+                # 提取所有层的细节系数
                 for i in range(self.level):
-                    cD = np.asarray(coeffs[i][1]).flatten()  # cD3, cD2, cD1
+                    cD = np.asarray(coeffs[i][1]).flatten()
                     var_coeffs.append(cD)
                 
-                # 堆叠成 (T, level+1)
-                # 转置使得形状为 (T, level+1) 而不是 (level+1, T)
-                var_coeffs_array = np.array(var_coeffs)  # (level+1, T)
-                var_coeffs_array = var_coeffs_array.T  # (T, level+1)
-                
+                # 堆叠成 (level+1, T) -> (T, level+1)
+                var_coeffs_array = np.array(var_coeffs).T
                 batch_coeffs.append(var_coeffs_array)
             
             # 堆叠成 (N, T, level+1)
@@ -88,13 +131,44 @@ class SWTDecomposition(nn.Module):
     
     def reconstruct(self, coeffs_tensor):
         """
-        从小波系数重构信号
+        从小波系数重构信号 (GPU 加速批处理版本)
         
         Args:
             coeffs_tensor: (B, N, T, level+1) 小波系数
             
         Returns:
             reconstructed: (B, N, T) 重构后的信号
+        """
+        if self.use_gpu:
+            return self._reconstruct_gpu(coeffs_tensor)
+        else:
+            return self._reconstruct_cpu(coeffs_tensor)
+    
+    def _reconstruct_gpu(self, coeffs_tensor):
+        """
+        GPU 加速重构：使用 ptwt.iswt
+        """
+        B, N, T, num_coeffs = coeffs_tensor.shape
+        device = coeffs_tensor.device
+        
+        # 重塑为 (B*N, T, level+1) -> (B*N, level+1, T)
+        coeffs = coeffs_tensor.reshape(B * N, T, num_coeffs).permute(0, 2, 1)
+        
+        # 将系数格式化为 ptwt.iswt 需要的列表格式
+        # coeffs: (B*N, level+1, T) -> list of (B*N, 1, T)
+        coeffs_list = [coeffs[:, i:i+1, :] for i in range(num_coeffs)]
+        
+        # 使用 ptwt.iswt 重构
+        reconstructed = ptwt_iswt(coeffs_list, self.wavelet)
+        
+        # 重塑回 (B, N, T)
+        reconstructed = reconstructed.squeeze(1).reshape(B, N, T)
+        
+        return reconstructed
+    
+    def _reconstruct_cpu(self, coeffs_tensor):
+        """
+        CPU 回退重构
         """
         B, N, T, _ = coeffs_tensor.shape
         device = coeffs_tensor.device
@@ -104,27 +178,21 @@ class SWTDecomposition(nn.Module):
         for b in range(B):
             batch_signals = []
             for n in range(N):
-                # 获取该变量的所有系数
-                # 先转换为 float32，因为 numpy 不支持 bfloat16
                 var_coeffs = coeffs_tensor[b, n, :, :].float().cpu().detach().numpy()
                 
                 # 重组成 pywt.iswt 格式
-                # var_coeffs: (T, level+1) -> [cA3, cD3, cD2, cD1]
-                # pywt.iswt 需要: [(cA3, cD3), (cA2, cD2), (cA1, cD1)]
                 coeffs = []
-                cA = var_coeffs[:, 0]  # cA3 (最粗尺度的近似系数)
+                cA = var_coeffs[:, 0]
                 
-                # 对于 level=3: cD3, cD2, cD1
                 for i in range(self.level):
-                    cD = var_coeffs[:, i + 1]  # cD3, cD2, cD1
+                    cD = var_coeffs[:, i + 1]
                     coeffs.append((cA, cD))
-                    # 对于后续层，不再需要近似系数（iswt会忽略除第一个外的cA）
                     cA = None
                 
                 # 执行逆 SWT
                 signal = pywt.iswt(coeffs, wavelet=self.wavelet, norm=True)
                 
-                # 由于 SWT 可能会改变长度，截断或填充到原始长度
+                # 截断或填充
                 if len(signal) > T:
                     signal = signal[:T]
                 elif len(signal) < T:

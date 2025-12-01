@@ -5,3 +5,5 @@ __pycache__/
 *.sh
 miniconda.sh
 t-Linux-x86_64.sh
+
+back/
