@@ -3,6 +3,10 @@ WaveletEmbed 模块的全面测试套件
 使用 pytest 框架进行结构化测试，支持参数化、性能测试、GPU测试等
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import pytest
 import torch
 import torch.nn as nn

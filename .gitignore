@@ -8,3 +8,5 @@ t-Linux-x86_64.sh
 
 back/
 results/
+.pytest_cache
+logs/

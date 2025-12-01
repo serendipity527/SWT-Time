@@ -3,3 +3,9 @@ checkpoints/
 datasets/
 
 
+.pytest_cache
+
+back/
+results/
+
+DOC/

@@ -99,7 +99,7 @@ parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
 
 # SWT parameters
-parser.add_argument('--use_swt', action='store_true', help='use SWT-Patch Embedding', default=False)
+parser.add_argument('--use_swt', action='store_true', help='use SWT-Patch Embedding', default=True)
 parser.add_argument('--swt_wavelet', type=str, default='db4', help='wavelet type: db4, db6, sym4, coif2, haar')
 parser.add_argument('--swt_level', type=int, default=3, help='SWT decomposition level')
 parser.add_argument('--use_all_coeffs', action='store_true', help='use all coefficients', default=True)
