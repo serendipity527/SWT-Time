@@ -81,6 +81,12 @@ def parse_args():
     parser.add_argument('--swt_level', type=int, default=3, help='SWT decomposition level')
     parser.add_argument('--use_all_coeffs', action='store_true', help='use all coefficients', default=True)
     
+    # DWT Prompt parameters
+    parser.add_argument('--use_dwt_prompt', action='store_true', help='use DWT dynamic prompt', default=False)
+    parser.add_argument('--dwt_prompt_level', type=int, default=3, help='DWT decomposition level for prompt')
+    parser.add_argument('--prompt_compression', type=str, default='balanced', 
+                        choices=['minimal', 'balanced', 'detailed'], help='prompt compression level')
+    
     return parser.parse_args()
 
 
@@ -208,7 +214,15 @@ def main():
     # 加载模型权重
     accelerator.print("正在加载模型权重...")
     state_dict = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(state_dict)
+    
+    # 使用strict=False允许部分权重不匹配（兼容新旧版本）
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    if missing_keys:
+        accelerator.print(f"⚠️  Missing keys: {missing_keys[:5]}...")  # 只显示前5个
+    if unexpected_keys:
+        accelerator.print(f"⚠️  Unexpected keys: {unexpected_keys[:5]}...")  # 只显示前5个
+    
     accelerator.print("模型权重加载成功!")
     
     # 准备模型和数据

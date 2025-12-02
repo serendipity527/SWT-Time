@@ -104,6 +104,12 @@ parser.add_argument('--swt_wavelet', type=str, default='db4', help='wavelet type
 parser.add_argument('--swt_level', type=int, default=3, help='SWT decomposition level')
 parser.add_argument('--use_all_coeffs', action='store_true', help='use all coefficients', default=True)
 
+# DWT Prompt parameters
+parser.add_argument('--use_dwt_prompt', action='store_true', help='use DWT dynamic prompt', default=False)
+parser.add_argument('--dwt_prompt_level', type=int, default=3, help='DWT decomposition level for prompt')
+parser.add_argument('--prompt_compression', type=str, default='balanced', 
+                    choices=['minimal', 'balanced', 'detailed'], help='prompt compression level')
+
 args = parser.parse_args()
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')

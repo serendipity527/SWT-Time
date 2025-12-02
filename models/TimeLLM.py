@@ -7,6 +7,7 @@ from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GP
     BertModel, BertTokenizer
 from layers.Embed import PatchEmbedding
 from layers.WaveletEmbed import WaveletPatchEmbedding
+from layers.DWTPromptGenerator import DWTPromptGenerator
 import transformers
 from layers.StandardNorm import Normalize
 
@@ -46,6 +47,11 @@ class Model(nn.Module):
         self.swt_wavelet = getattr(configs, 'swt_wavelet', 'db4')  # 小波基
         self.swt_level = getattr(configs, 'swt_level', 3)  # 分解层数
         self.use_all_coeffs = getattr(configs, 'use_all_coeffs', True)  # 是否使用所有系数
+        
+        # DWT Prompt 配置
+        self.use_dwt_prompt = getattr(configs, 'use_dwt_prompt', False)  # 是否使用DWT动态prompt
+        self.dwt_prompt_level = getattr(configs, 'dwt_prompt_level', 3)  # DWT分解层数
+        self.prompt_compression = getattr(configs, 'prompt_compression', 'balanced')  # prompt压缩级别
 
         if configs.llm_model == 'LLAMA':
             # self.llama_config = LlamaConfig.from_pretrained('/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/')
@@ -176,6 +182,18 @@ class Model(nn.Module):
             self.description = 'The Electricity Transformer Temperature (ETT) is a crucial indicator in the electric power long-term deployment.'
 
         self.dropout = nn.Dropout(configs.dropout)
+        
+        # 初始化 DWT Prompt 生成器
+        if self.use_dwt_prompt:
+            print(f"[Time-LLM] 使用 DWT 动态 Prompt V2 (修复版): 小波基={self.swt_wavelet}, 分解层数={self.dwt_prompt_level}, 压缩级别={self.prompt_compression}")
+            self.dwt_prompt_generator = DWTPromptGenerator(
+                wavelet=self.swt_wavelet,
+                level=self.dwt_prompt_level,
+                compression_level=self.prompt_compression
+            )
+        else:
+            print("[Time-LLM] 使用原始统计特征 Prompt")
+            self.dwt_prompt_generator = None
 
         # 选择使用 SWT + Patch Embedding 或原始 Patch Embedding
         if self.use_swt:
@@ -219,6 +237,11 @@ class Model(nn.Module):
         x_enc = self.normalize_layers(x_enc, 'norm')
 
         B, T, N = x_enc.size()
+        
+        # 保存原始形状用于DWT处理 (B, T, N) -> (B, N, T)
+        if self.use_dwt_prompt and self.dwt_prompt_generator is not None:
+            x_enc_for_dwt = x_enc.permute(0, 2, 1).contiguous()  # (B, N, T)
+        
         x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
 
         min_values = torch.min(x_enc, dim=1)[0]
@@ -228,23 +251,54 @@ class Model(nn.Module):
         trends = x_enc.diff(dim=1).sum(dim=1)
 
         prompt = []
-        for b in range(x_enc.shape[0]):
-            min_values_str = str(min_values[b].tolist()[0])
-            max_values_str = str(max_values[b].tolist()[0])
-            median_values_str = str(medians[b].tolist()[0])
-            lags_values_str = str(lags[b].tolist())
-            prompt_ = (
-                f"<|start_prompt|>Dataset description: {self.description}"
-                f"Task description: forecast the next {str(self.pred_len)} steps given the previous {str(self.seq_len)} steps information; "
-                "Input statistics: "
-                f"min value {min_values_str}, "
-                f"max value {max_values_str}, "
-                f"median value {median_values_str}, "
-                f"the trend of input is {'upward' if trends[b] > 0 else 'downward'}, "
-                f"top 5 lags are : {lags_values_str}<|<end_prompt>|>"
-            )
+        
+        # 根据配置选择prompt生成方式
+        if self.use_dwt_prompt and self.dwt_prompt_generator is not None:
+            # 使用DWT动态prompt生成器 V2 (修复版)
+            # 生成B个prompt（每个batch一个），然后复制N次以匹配B*N的enc_out
+            for b in range(B):  # 遍历batch
+                # 提取DWT特征，使用保存的原始形状数据
+                x_sample = x_enc_for_dwt[b:b+1, :, :]  # (1, N, T)
+                dwt_features = self.dwt_prompt_generator(x_sample)
+                
+                # 修复: 聚合所有变量的统计信息，而不是只取第一个变量
+                start_idx = b * N
+                end_idx = (b + 1) * N
+                # 获取当前batch的lags（取第一个变量的lags作为代表）
+                batch_lags = lags[start_idx].tolist()
+                base_info = {
+                    'min': min_values[start_idx:end_idx].mean().item(),  # 所有变量的平均最小值
+                    'max': max_values[start_idx:end_idx].mean().item(),  # 所有变量的平均最大值
+                    'median': medians[start_idx:end_idx].mean().item(),  # 所有变量的平均中位数
+                    'lags': batch_lags,  # 添加lags字段
+                    'description': self.description,
+                    'seq_len': self.seq_len,
+                    'pred_len': self.pred_len
+                }
+                
+                # 生成prompt文本，并复制N次（每个变量一个）
+                prompt_ = self.dwt_prompt_generator.build_prompt_text(dwt_features, base_info)
+                for _ in range(N):
+                    prompt.append(prompt_)
+        else:
+            # 使用原版统计特征prompt
+            for b in range(x_enc.shape[0]):
+                min_values_str = str(min_values[b].tolist()[0])
+                max_values_str = str(max_values[b].tolist()[0])
+                median_values_str = str(medians[b].tolist()[0])
+                lags_values_str = str(lags[b].tolist())
+                prompt_ = (
+                    f"<|start_prompt|>Dataset description: {self.description}"
+                    f"Task description: forecast the next {str(self.pred_len)} steps given the previous {str(self.seq_len)} steps information; "
+                    "Input statistics: "
+                    f"min value {min_values_str}, "
+                    f"max value {max_values_str}, "
+                    f"median value {median_values_str}, "
+                    f"the trend of input is {'upward' if trends[b] > 0 else 'downward'}, "
+                    f"top 5 lags are : {lags_values_str}<|<end_prompt>|>"
+                )
 
-            prompt.append(prompt_)
+                prompt.append(prompt_)
 
         x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
 

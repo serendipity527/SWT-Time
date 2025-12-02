@@ -209,9 +209,10 @@ class WaveletPatchEmbedding(nn.Module):
         # 转置为 (B*N, patch_len*(...), num_patches)
         x_patch = x_patch.transpose(1, 2)
         
-        # 确保数据类型为 float32（Conv1d 需要）
-        if x_patch.dtype != torch.float32:
-            x_patch = x_patch.float()
+        # 确保数据类型与模型权重一致（支持混合精度训练）
+        weight_dtype = self.value_embedding.weight.dtype
+        if x_patch.dtype != weight_dtype:
+            x_patch = x_patch.to(weight_dtype)
         
         # 通过卷积进行嵌入: (B*N, d_model, num_patches)
         x_embed = self.value_embedding(x_patch)
