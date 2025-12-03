@@ -1,1 +1,11 @@
 *.gz
+
+dataset/
+data_provider_pretrain/
+data_provider_pretrain/
+checkpoints/
+logs/
+
+*.pyc
+
+*.log
