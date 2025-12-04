@@ -28,6 +28,106 @@ class FlattenHead(nn.Module):
         return x
 
 
+class WaveletHead(nn.Module):
+    """小波系数预测头 - 对称小波域输出
+    
+    将LLM隐状态投影到小波系数空间，然后通过ISWT重构回时域信号。
+    与WaveletPatchEmbedding形成完整的"小波编码-LLM处理-小波解码"架构。
+    
+    架构优势：
+    1. 对称设计：编码(SWT) ↔ 解码(ISWT)
+    2. 频域约束：保证输出符合小波理论和频谱特性
+    3. 多尺度预测：LLM分别学习不同频段（趋势、细节）
+    4. 可解释性：可以分析各频段的预测质量
+    
+    Args:
+        n_vars: 变量数量
+        d_model: LLM隐状态维度
+        patch_nums: patch数量
+        pred_len: 预测长度
+        level: 小波分解层数（需与编码器一致）
+        wavelet: 小波基函数（需与编码器一致）
+        head_dropout: dropout率
+    
+    Input:
+        x: (B, N, d_model, patch_nums) - LLM处理后的隐状态
+    
+    Output:
+        pred: (B, N, pred_len) - 预测的时域信号
+    
+    工作流程：
+        LLM隐状态 (B, N, d_model, patch_nums)
+          ↓ 为每个频段独立投影
+        小波系数预测:
+          - cA_pred: (B, N, pred_len) 低频趋势
+          - cD3_pred: (B, N, pred_len) 高频细节
+          - cD2_pred: (B, N, pred_len) 中频细节
+          - cD1_pred: (B, N, pred_len) 低频细节
+          ↓ Stack到频段维度
+        (B, N, pred_len, Level+1)
+          ↓ ISWT重构
+        (B, N, pred_len)  ← 最终时域预测
+    """
+    
+    def __init__(self, n_vars, d_model, patch_nums, pred_len, 
+                 level=3, wavelet='db4', head_dropout=0):
+        super().__init__()
+        self.n_vars = n_vars
+        self.pred_len = pred_len
+        self.level = level
+        self.num_bands = level + 1  # 频段数量
+        self.wavelet = wavelet
+        
+        # 为每个频段创建独立的投影层
+        # 这允许LLM学习不同频段的不同特性（如趋势 vs 细节）
+        self.band_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Flatten(start_dim=-2),  # (B, N, d_model, patch_nums) -> (B, N, d_model*patch_nums)
+                nn.Linear(d_model * patch_nums, pred_len),  # -> (B, N, pred_len)
+                nn.Dropout(head_dropout)
+            )
+            for _ in range(self.num_bands)
+        ])
+        
+        # ISWT重构模块
+        from layers.WaveletEmbed import ISWTReconstruction
+        self.iswt = ISWTReconstruction(wavelet=wavelet, level=level)
+        
+        print(f"[WaveletHead] 创建小波输出头：{self.num_bands}个频段投影层 + ISWT重构")
+        print(f"  - 小波类型: {wavelet}")
+        print(f"  - 分解层数: {level}")
+        print(f"  - 每个频段参数量: {d_model * patch_nums * pred_len:,}")
+        print(f"  - 总参数量: {d_model * patch_nums * pred_len * self.num_bands:,}")
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, N, d_model, patch_nums) - LLM隐状态
+        
+        Returns:
+            pred: (B, N, pred_len) - 预测的时域信号
+        """
+        B, N, d_model, patch_nums = x.shape
+        
+        # Step 1: 为每个频段生成预测的小波系数
+        wavelet_coeffs = []
+        for i, proj in enumerate(self.band_projections):
+            # 每个投影层输出该频段的预测系数
+            coeff = proj(x)  # (B, N, pred_len)
+            wavelet_coeffs.append(coeff)
+        
+        # Step 2: Stack到频段维度
+        # [(B, N, pred_len)] * num_bands -> (B, N, pred_len, num_bands)
+        # 顺序: [cA_pred, cD_n_pred, cD_{n-1}_pred, ..., cD_1_pred]
+        wavelet_coeffs = torch.stack(wavelet_coeffs, dim=-1)
+        
+        # Step 3: ISWT重构回时域
+        # (B, N, pred_len, num_bands) -> (B, N, pred_len)
+        pred = self.iswt(wavelet_coeffs)
+        
+        return pred
+
+
 class Model(nn.Module):
 
     def __init__(self, configs, patch_len=16, stride=8):
@@ -203,8 +303,31 @@ class Model(nn.Module):
         self.head_nf = self.d_ff * self.patch_nums
 
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
-                                                 head_dropout=configs.dropout)
+            # 可通过配置选择输出头类型
+            use_wavelet_head = getattr(configs, 'use_wavelet_head', False)
+            
+            if use_wavelet_head:
+                # 小波系数输出头：对称小波域架构
+                # LLM隐状态 -> 小波系数预测 -> ISWT重构 -> 时域预测
+                self.output_projection = WaveletHead(
+                    n_vars=configs.enc_in,
+                    d_model=self.d_ff,
+                    patch_nums=self.patch_nums,
+                    pred_len=self.pred_len,
+                    level=getattr(configs, 'swt_level', 3),
+                    wavelet=getattr(configs, 'wavelet', 'db4'),
+                    head_dropout=configs.dropout
+                )
+                print("[TimeLLM] 使用 WaveletHead 输出层")
+                print(f"  - 架构: LLM隐状态 → 小波系数({getattr(configs, 'swt_level', 3)+1}频段) → ISWT重构 → 时域预测")
+            else:
+                # 原始线性输出头：直接时域映射
+                # LLM隐状态 -> 线性层 -> 时域预测
+                self.output_projection = FlattenHead(
+                    configs.enc_in, self.head_nf, self.pred_len,
+                    head_dropout=configs.dropout
+                )
+                print("[TimeLLM] 使用 FlattenHead 输出层（直接时域映射）")
         else:
             raise NotImplementedError
 

@@ -188,7 +188,6 @@ class SWTDecomposition(nn.Module):
         self._validate_input(x)
         
         B, N, T = x.shape
-        device = x.device
         dtype = x.dtype
         
         # 1.5 数据类型转换：ptwt不支持bfloat16，需要转换为float32
@@ -267,6 +266,186 @@ class SWTDecomposition(nn.Module):
             coeffs_output = coeffs_output.bfloat16()
         
         return coeffs_output
+
+
+class ISWTReconstruction(nn.Module):
+    """逆平稳小波变换(ISWT)重构模块 - GPU加速版本
+    
+    将多频段小波系数通过逆SWT重构回时域信号。
+    与SWTDecomposition形成对称的编码-解码架构。
+    
+    特点：
+    1. 完美重构（在理论上可以完全恢复原信号）
+    2. GPU加速，支持批量处理
+    3. 与SWTDecomposition接口对称
+    
+    Args:
+        wavelet: 小波基函数名称（需与分解时一致）
+        level: SWT分解层数（需与分解时一致）
+    
+    Input:
+        coeffs: (B, N, T, Level+1) - 多频段小波系数
+                最后一维的排列顺序：[cA_n, cD_n, cD_{n-1}, ..., cD_1]
+                （与SWTDecomposition输出格式一致）
+    
+    Output:
+        x: (B, N, T) - 重构的时域信号
+    
+    示例：
+        >>> # 分解
+        >>> swt = SWTDecomposition(wavelet='db4', level=3)
+        >>> x = torch.randn(8, 7, 512)
+        >>> coeffs = swt(x)  # (8, 7, 512, 4)
+        >>> 
+        >>> # 重构
+        >>> iswt = ISWTReconstruction(wavelet='db4', level=3)
+        >>> x_recon = iswt(coeffs)  # (8, 7, 512)
+        >>> 
+        >>> # 验证重构误差
+        >>> error = torch.abs(x - x_recon).mean()
+        >>> print(f"重构误差: {error:.6f}")  # 应该接近0
+    """
+    
+    def __init__(self, 
+                 wavelet: str = 'db4', 
+                 level: int = 3):
+        super(ISWTReconstruction, self).__init__()
+        
+        # 检查ptwt库是否可用
+        if not PTWT_AVAILABLE:
+            raise ImportError(
+                "ptwt库未安装，无法使用GPU加速的ISWT。\n"
+                "请运行: pip install ptwt"
+            )
+        
+        self.wavelet_name = wavelet
+        self.level = level
+        self.num_bands = level + 1
+        
+        # 验证小波名称
+        valid_wavelets = [
+            'haar', 'db1', 'db2', 'db3', 'db4', 'db5', 'db6', 'db7', 'db8',
+            'sym2', 'sym3', 'sym4', 'sym5', 'sym6', 'sym7', 'sym8',
+            'coif1', 'coif2', 'coif3', 'coif4', 'coif5'
+        ]
+        if wavelet not in valid_wavelets:
+            warnings.warn(
+                f"小波 '{wavelet}' 可能不被ptwt支持。\n"
+                f"常用的小波类型: {', '.join(valid_wavelets[:10])}..."
+            )
+    
+    def _validate_input(self, coeffs: torch.Tensor) -> None:
+        """验证输入小波系数的合法性
+        
+        Args:
+            coeffs: 输入小波系数 (B, N, T, Level+1)
+        
+        Raises:
+            ValueError: 如果输入不满足要求
+        """
+        if coeffs.ndim != 4:
+            raise ValueError(
+                f"输入必须是4维张量 (Batch, N_vars, Time, Bands)，当前维度: {coeffs.ndim}"
+            )
+        
+        B, N, T, num_bands = coeffs.shape
+        
+        # 检查频段数
+        if num_bands != self.num_bands:
+            raise ValueError(
+                f"频段数不匹配：期望 {self.num_bands}，实际 {num_bands}"
+            )
+        
+        # 检查序列长度
+        min_length = 2 ** self.level
+        if T < min_length:
+            raise ValueError(
+                f"序列长度 {T} 太短，ISWT({self.level}层)至少需要 {min_length} 个时间步"
+            )
+        
+        # 检查是否包含NaN或Inf
+        if torch.isnan(coeffs).any() or torch.isinf(coeffs).any():
+            raise ValueError("输入包含NaN或Inf值，无法进行重构")
+    
+    def forward(self, coeffs: torch.Tensor) -> torch.Tensor:
+        """
+        执行逆平稳小波变换
+        
+        Args:
+            coeffs: (B, N, T, Level+1) - 小波系数
+                    B: batch大小
+                    N: 变量数量
+                    T: 时间步长度
+                    Level+1: 频段数量 [cA_n, cD_n, ..., cD_1]
+        
+        Returns:
+            x: (B, N, T) - 重构的时域信号
+        
+        维度变换流程：
+            (B, N, T, Level+1)
+            -> Reshape -> (B*N, T, Level+1)
+            -> 重排系数顺序为ptwt格式
+            -> ptwt.iswt -> (B*N, T)
+            -> Reshape -> (B, N, T)
+        """
+        # 1. 输入验证
+        self._validate_input(coeffs)
+        
+        B, N, T, num_bands = coeffs.shape
+        device = coeffs.device
+        dtype = coeffs.dtype
+        
+        # 2. 数据类型转换：ptwt不支持bfloat16
+        if dtype == torch.bfloat16:
+            coeffs = coeffs.float()
+            convert_back_to_bfloat16 = True
+        else:
+            convert_back_to_bfloat16 = False
+        
+        # 3. Reshape: (B, N, T, Level+1) -> (B*N, T, Level+1)
+        coeffs_reshaped = coeffs.reshape(B * N, T, num_bands)
+        
+        # 4. 重排系数顺序以匹配ptwt.iswt的格式
+        # 输入格式: [cA_n, cD_n, cD_{n-1}, ..., cD_1]
+        # ptwt.iswt期望: [cD_1, cD_2, ..., cD_n, cA_n]
+        coeffs_list = []
+        
+        # 从后往前取细节系数 (cD_1, cD_2, ..., cD_n)
+        for i in range(num_bands - 1, 0, -1):
+            coeffs_list.append(coeffs_reshaped[:, :, i])
+        
+        # 最后添加近似系数 (cA_n)
+        coeffs_list.append(coeffs_reshaped[:, :, 0])
+        
+        # 5. 执行ISWT（GPU加速）
+        try:
+            x_reconstructed = ptwt.iswt(
+                coeffs_list,         # list of tensors: [cD1, cD2, ..., cDn, cAn]
+                self.wavelet_name    # 小波名称字符串
+            )  # 输出: (B*N, T)
+            
+        except Exception as e:
+            raise RuntimeError(
+                f"ISWT重构失败: {e}\n"
+                f"系数形状: {[c.shape for c in coeffs_list]}, "
+                f"小波: {self.wavelet_name}, 层数: {self.level}"
+            )
+        
+        # 6. Reshape回原始batch结构
+        # (B*N, T) -> (B, N, T)
+        x_reconstructed = x_reconstructed.reshape(B, N, T)
+        
+        # 7. 数值稳定性检查
+        if torch.isnan(x_reconstructed).any():
+            warnings.warn(
+                "ISWT重构结果包含NaN值，可能是输入系数异常"
+            )
+        
+        # 8. 转回原始数据类型
+        if convert_back_to_bfloat16:
+            x_reconstructed = x_reconstructed.bfloat16()
+        
+        return x_reconstructed
 
 
 class WaveletPatchEmbedding(nn.Module):

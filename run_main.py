@@ -98,7 +98,17 @@ parser.add_argument('--use_amp', action='store_true', help='use automatic mixed 
 parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
 
+# wavelet config
+parser.add_argument('--use_wavelet', type=int, default=1, help='whether to use wavelet patch embedding')
+parser.add_argument('--use_wavelet_head', type=int, default=0, help='whether to use wavelet head for output')
+parser.add_argument('--wavelet', type=str, default='db4', help='wavelet type: db4, haar, sym4, etc.')
+parser.add_argument('--swt_level', type=int, default=3, help='SWT decomposition level')
+
 args = parser.parse_args()
+
+# Convert int flags to boolean
+args.use_wavelet = bool(args.use_wavelet)
+args.use_wavelet_head = bool(args.use_wavelet_head)
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
 accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
