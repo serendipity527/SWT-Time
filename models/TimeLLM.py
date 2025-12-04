@@ -6,6 +6,7 @@ import torch.nn as nn
 from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
     BertModel, BertTokenizer
 from layers.Embed import PatchEmbedding
+from layers.WaveletEmbed import WaveletPatchEmbedding  # 添加小波Patch Embedding
 import transformers
 from layers.StandardNorm import Normalize
 
@@ -170,8 +171,26 @@ class Model(nn.Module):
 
         self.dropout = nn.Dropout(configs.dropout)
 
-        self.patch_embedding = PatchEmbedding(
-            configs.d_model, self.patch_len, self.stride, configs.dropout)
+        # 使用WaveletPatchEmbedding替代原始PatchEmbedding
+        # 可以通过configs.use_wavelet控制是否启用（默认启用）
+        use_wavelet = getattr(configs, 'use_wavelet', True)
+        
+        if use_wavelet:
+            # 小波Patch Embedding：先SWT分解，再Patching
+            self.patch_embedding = WaveletPatchEmbedding(
+                d_model=configs.d_model,
+                patch_len=self.patch_len,
+                stride=self.stride,
+                wavelet=getattr(configs, 'wavelet', 'db4'),  # 默认db4小波
+                level=getattr(configs, 'swt_level', 3),      # 默认3层分解
+                dropout=configs.dropout
+            )
+            print(f"[TimeLLM] 使用 WaveletPatchEmbedding (小波={getattr(configs, 'wavelet', 'db4')}, 层数={getattr(configs, 'swt_level', 3)})")
+        else:
+            # 原始Patch Embedding
+            self.patch_embedding = PatchEmbedding(
+                configs.d_model, self.patch_len, self.stride, configs.dropout)
+            print("[TimeLLM] 使用 原始 PatchEmbedding")
 
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
         self.vocab_size = self.word_embeddings.shape[0]
