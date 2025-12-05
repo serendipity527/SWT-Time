@@ -13,6 +13,214 @@ from layers.StandardNorm import Normalize
 transformers.logging.set_verbosity_error()
 
 
+class FrequencyAnalyzer:
+    """频域特征分析器（基于SWT小波系数）
+    
+    零冗余设计：完全复用WaveletPatchEmbedding的SWT分解结果，无额外计算开销。
+    
+    实现维度：
+        - 维度1：信号质量评估（SNR、可预测性指数）
+        - 维度2：频段成分画像（主导成分、平衡度、关联分析）
+        - 维度3：频域-时域统一表达（振幅-频率、周期-频段映射、趋势一致性）
+    """
+    
+    @staticmethod
+    def analyze(coeffs, x_enc, trends, lags, level=3):
+        """分析频域特征（维度1+2+3）
+        
+        Args:
+            coeffs: (B, N, T, num_bands) - SWT小波系数
+            x_enc: (B, N, T) - 原始输入序列（用于振幅分析）
+            trends: (B*N,) - 趋势特征
+            lags: (B*N, top_k) - 周期特征
+            level: int - 小波分解层数
+        
+        Returns:
+            dict: 频域特征字典
+        """
+        B, N, T, num_bands = coeffs.shape
+        
+        # ========== 维度1：信号质量评估 ==========
+        
+        # 1.1 计算各频段能量
+        band_energies = torch.mean(coeffs ** 2, dim=2)  # (B, N, num_bands)
+        total_energy = torch.sum(band_energies, dim=2, keepdim=True) + 1e-9
+        energy_ratios = band_energies / total_energy  # (B, N, num_bands)
+        
+        # 1.2 SNR（信噪比）：低频信号 / 最高频噪声
+        signal_power = band_energies[:, :, 0]  # cA{level} - 低频趋势
+        noise_power = band_energies[:, :, 1]   # cD{level} - 最高频细节
+        snr_db = 10 * torch.log10(signal_power / (noise_power + 1e-9))
+        snr_db = torch.clamp(snr_db, -60, 60)  # 限制范围
+        
+        # 1.3 可预测性指数：低频占比 × (1 - 归一化熵)
+        # 熵计算
+        entropy = -torch.sum(
+            energy_ratios * torch.log(energy_ratios + 1e-9), 
+            dim=2
+        )  # (B, N)
+        max_entropy = torch.log(torch.tensor(num_bands, dtype=torch.float32))
+        normalized_entropy = entropy / max_entropy  # 归一化到[0,1]
+        
+        low_freq_ratio = energy_ratios[:, :, 0]  # cA占比
+        predictability = low_freq_ratio * (1 - normalized_entropy)  # (B, N)
+        
+        # ========== 维度2：频段成分画像 ==========
+        
+        # 2.1 主导频段（能量最大的频段）
+        dominant_band_idx = torch.argmax(energy_ratios, dim=2)  # (B, N)
+        
+        # 2.2 成分平衡度：最大能量 / 次大能量
+        sorted_energies, _ = torch.sort(energy_ratios, dim=2, descending=True)
+        balance_ratio = sorted_energies[:, :, 0] / (sorted_energies[:, :, 1] + 1e-9)
+        
+        # 2.3 高频占比（细节能量总和）
+        high_freq_ratio = torch.sum(energy_ratios[:, :, 1:], dim=2)  # (B, N)
+        
+        # ========== 维度3：频域-时域统一表达 ==========
+        
+        # 3.1 振幅-频率关系：(max-min) × 高频占比
+        min_vals = torch.min(x_enc, dim=2)[0]  # (B, N)
+        max_vals = torch.max(x_enc, dim=2)[0]  # (B, N)
+        amplitude_freq_score = (max_vals - min_vals) * high_freq_ratio
+        
+        # 3.2 趋势-低频一致性
+        # cA系数均值的符号 vs trends的符号
+        cA_mean = torch.mean(coeffs[:, :, :, 0], dim=2)  # (B, N)
+        trends_reshaped = trends.reshape(B, N)  # (B, N)
+        trend_consistency = (torch.sign(cA_mean) == torch.sign(trends_reshaped)).float()
+        
+        # 3.3 周期-频段映射（分析主周期对应的频段）
+        # lags[0]是最显著的周期
+        primary_lag = lags.reshape(B, N, -1)[:, :, 0]  # (B, N)
+        # 根据周期长度推断对应频段
+        # 短周期(1-8) -> cD1, 中短(8-24) -> cD2, 中长(24-96) -> cD3, 长(>96) -> cA
+        period_band = torch.zeros_like(primary_lag)
+        period_band = torch.where(primary_lag <= 8, torch.tensor(3), period_band)  # cD1
+        period_band = torch.where((primary_lag > 8) & (primary_lag <= 24), torch.tensor(2), period_band)  # cD2
+        period_band = torch.where((primary_lag > 24) & (primary_lag <= 96), torch.tensor(1), period_band)  # cD3
+        period_band = torch.where(primary_lag > 96, torch.tensor(0), period_band)  # cA
+        
+        # 周期与频段的一致性：主导频段是否与周期对应
+        period_consistency = (dominant_band_idx == period_band).float()
+        
+        return {
+            # 维度1：信号质量
+            'snr_db': snr_db,  # (B, N)
+            'predictability': predictability,  # (B, N)
+            'entropy': normalized_entropy,  # (B, N)
+            
+            # 维度2：频段成分
+            'energy_ratios': energy_ratios,  # (B, N, num_bands)
+            'dominant_band_idx': dominant_band_idx,  # (B, N)
+            'balance_ratio': balance_ratio,  # (B, N)
+            'high_freq_ratio': high_freq_ratio,  # (B, N)
+            'low_freq_ratio': low_freq_ratio,  # (B, N)
+            
+            # 维度3：频域-时域关联
+            'amplitude_freq_score': amplitude_freq_score,  # (B, N)
+            'trend_consistency': trend_consistency,  # (B, N)
+            'period_consistency': period_consistency,  # (B, N)
+            'primary_lag': primary_lag,  # (B, N)
+        }
+    
+    @staticmethod
+    def generate_description(features, var_idx=0, level=3):
+        """生成自然语言描述（针对单个变量）
+        
+        Args:
+            features: dict - analyze()返回的特征字典
+            var_idx: int - 变量索引（在第二维度上）
+            level: int - 小波分解层数
+        
+        Returns:
+            str - 自然语言描述
+        """
+        # 提取当前变量的特征（假设batch_size=1或取第0个batch）
+        snr = features['snr_db'][0, var_idx].item()
+        pred_score = features['predictability'][0, var_idx].item()
+        entropy = features['entropy'][0, var_idx].item()
+        
+        energy_dist = features['energy_ratios'][0, var_idx].cpu().numpy()
+        dominant_idx = features['dominant_band_idx'][0, var_idx].item()
+        balance = features['balance_ratio'][0, var_idx].item()
+        high_freq = features['high_freq_ratio'][0, var_idx].item()
+        low_freq = features['low_freq_ratio'][0, var_idx].item()
+        
+        amp_freq = features['amplitude_freq_score'][0, var_idx].item()
+        trend_cons = features['trend_consistency'][0, var_idx].item()
+        period_cons = features['period_consistency'][0, var_idx].item()
+        primary_lag = features['primary_lag'][0, var_idx].item()
+        
+        # 频段名称映射
+        band_names = [f"cA{level}"] + [f"cD{level-i}" for i in range(level)]
+        
+        desc_parts = []
+        
+        # ========== 维度1：信号质量描述 ==========
+        quality_level = "high" if pred_score > 0.5 else "moderate" if pred_score > 0.25 else "low"
+        snr_desc = "clean" if snr > 10 else "moderate" if snr > 0 else "noisy"
+        
+        desc_parts.append(
+            f"Signal quality: {snr_desc} (SNR: {snr:.1f} dB), "
+            f"{quality_level} predictability (score: {pred_score:.2f})"
+        )
+        
+        # ========== 维度2：频段成分描述 ==========
+        # 能量分布
+        energy_str = ", ".join([f"{e:.1%}" for e in energy_dist])
+        dominant_name = band_names[int(dominant_idx)]
+        
+        # 主导类型判断
+        if low_freq > 0.6:
+            composition = f"dominated by low-frequency trend ({dominant_name}: {energy_dist[int(dominant_idx)]:.1%})"
+        elif high_freq > 0.6:
+            composition = f"dominated by high-frequency details ({energy_dist[1]:.1%} + {energy_dist[2]:.1%} + {energy_dist[3]:.1%})"
+        else:
+            composition = f"balanced frequency components (peak at {dominant_name}: {energy_dist[int(dominant_idx)]:.1%})"
+        
+        # 成分平衡
+        if balance > 3.0:
+            balance_desc = "highly concentrated"
+        elif balance > 1.5:
+            balance_desc = "moderately focused"
+        else:
+            balance_desc = "well distributed"
+        
+        desc_parts.append(
+            f"Frequency composition: {composition}, "
+            f"energy is {balance_desc} (ratio: {balance:.1f}:1)"
+        )
+        
+        # ========== 维度3：频域-时域关联描述 ==========
+        # 趋势一致性
+        if trend_cons > 0.5:
+            trend_desc = "the trend is confirmed by low-frequency components"
+        else:
+            trend_desc = "the trend may be disrupted by high-frequency noise"
+        
+        # 周期-频段映射
+        if period_cons > 0.5:
+            period_desc = f"the {int(primary_lag)}-step periodicity aligns with {dominant_name} band"
+        else:
+            period_desc = f"the {int(primary_lag)}-step periodicity shows weak frequency alignment"
+        
+        # 振幅-频率关系
+        if amp_freq > 1.0:
+            volatility_desc = "high volatility with frequent rapid changes"
+        elif amp_freq > 0.3:
+            volatility_desc = "moderate fluctuations"
+        else:
+            volatility_desc = "stable with smooth variations"
+        
+        desc_parts.append(
+            f"Pattern-frequency alignment: {trend_desc}; {period_desc}; "
+            f"{volatility_desc}"
+        )
+        
+        return "; ".join(desc_parts)
+
+
 class FlattenHead(nn.Module):
     def __init__(self, n_vars, nf, target_window, head_dropout=0):
         super().__init__()
@@ -438,6 +646,13 @@ class Model(nn.Module):
             self.description = 'The Electricity Transformer Temperature (ETT) is a crucial indicator in the electric power long-term deployment.'
 
         self.dropout = nn.Dropout(configs.dropout)
+        
+        # ===== 频域Prompt开关（默认关闭）=====
+        self.use_freq_prompt = getattr(configs, 'use_freq_prompt', False)
+        if self.use_freq_prompt:
+            print("[TimeLLM] ✅ 频域Prompt增强已启用（维度1+2+3）")
+        else:
+            print("[TimeLLM] ⚪ 频域Prompt增强未启用")
 
         # 使用WaveletPatchEmbedding替代原始PatchEmbedding
         # 可以通过configs.use_wavelet控制是否启用（默认启用）
@@ -576,6 +791,27 @@ class Model(nn.Module):
         medians = torch.median(x_enc, dim=1).values
         lags = self.calcute_lags(x_enc)
         trends = x_enc.diff(dim=1).sum(dim=1)
+        
+        # ===== 频域特征分析（如果启用）=====
+        freq_features = None
+        if self.use_freq_prompt and hasattr(self.patch_embedding, 'swt'):
+            # 复用patch_embedding的SWT模块提取小波系数
+            with torch.no_grad():
+                # 转换数据形状: (B*N, T, 1) -> (B, N, T)
+                x_for_swt = x_enc.reshape(B, N, T)
+                # 调用SWT分解
+                coeffs = self.patch_embedding.swt(x_for_swt.to(torch.bfloat16))
+                # coeffs: (B, N, T, num_bands)
+                
+                # 提取频域特征
+                swt_level = getattr(self.patch_embedding, 'level', 3)
+                freq_features = FrequencyAnalyzer.analyze(
+                    coeffs=coeffs,
+                    x_enc=x_for_swt,
+                    trends=trends,
+                    lags=lags,
+                    level=swt_level
+                )
 
         prompt = []
         for b in range(x_enc.shape[0]):
@@ -583,6 +819,18 @@ class Model(nn.Module):
             max_values_str = str(max_values[b].tolist()[0])
             median_values_str = str(medians[b].tolist()[0])
             lags_values_str = str(lags[b].tolist())
+            # ===== 生成频域描述（如果启用）=====
+            freq_desc = ""
+            if freq_features is not None:
+                # 当前样本的变量索引
+                var_idx = b % N
+                # 生成自然语言描述
+                swt_level = getattr(self.patch_embedding, 'level', 3)
+                freq_analysis = FrequencyAnalyzer.generate_description(
+                    freq_features, var_idx=var_idx, level=swt_level
+                )
+                freq_desc = f"Frequency analysis: {freq_analysis}; "
+            
             prompt_ = (
                 f"<|start_prompt|>Dataset description: {self.description}"
                 f"Task description: forecast the next {str(self.pred_len)} steps given the previous {str(self.seq_len)} steps information; "
@@ -591,7 +839,9 @@ class Model(nn.Module):
                 f"max value {max_values_str}, "
                 f"median value {median_values_str}, "
                 f"the trend of input is {'upward' if trends[b] > 0 else 'downward'}, "
-                f"top 5 lags are : {lags_values_str}<|<end_prompt>|>"
+                f"top 5 lags are : {lags_values_str}; "
+                f"{freq_desc}"
+                f"<|<end_prompt>|>"
             )
 
             prompt.append(prompt_)
