@@ -640,17 +640,40 @@ class WaveletPatchEmbedding(nn.Module):
             B, N, self.num_bands, num_patches, self.d_model
         )
         
-        # ===== Step 8: 频段融合（简单平均） =====
-        # (B, N, Level+1, num_patches, d_model)
-        # -> (B, N, num_patches, d_model)  [在Level+1维度取平均]
-        x_fused = x_reshaped.mean(dim=2)
+        # ===== Step 8: 频段独立性保持（编码-解码对称优化）=====
+        # ⚠️ 关键改动：不再使用简单平均融合！
+        # 原方案（不对称）：
+        #   编码：4频段 → mean融合 → 1混合向量
+        #   解码：1混合向量 → 分离 → 4频段  ❌ 信息瓶颈
+        #
+        # 新方案（对称）：
+        #   编码：4频段 → 保持独立 → 4频段特征
+        #   解码：4频段特征 → 独立预测 → 4频段  ✅ 信息无损
+        #
+        # (B, N, num_bands, num_patches, d_model)
+        # -> (B, N, num_patches, num_bands*d_model)
+        # 将频段维度展平到特征维度，而不是平均掉
+        x_multiband = x_reshaped.permute(0, 1, 3, 2, 4).contiguous()
+        # (B, N, num_patches, num_bands, d_model)
+        
+        x_multiband = x_multiband.reshape(
+            B, N, num_patches, self.num_bands * self.d_model
+        )
+        # (B, N, num_patches, 4*d_model)  例如：4*32=128维
         
         # ===== Step 9: 最终reshape =====
-        # (B, N, num_patches, d_model) -> (B*N, num_patches, d_model)
-        output = x_fused.reshape(B * N, num_patches, self.d_model)
+        # (B, N, num_patches, num_bands*d_model) 
+        # -> (B*N, num_patches, num_bands*d_model)
+        output = x_multiband.reshape(B * N, num_patches, self.num_bands * self.d_model)
         
         # ===== Step 10: Dropout =====
         output = self.dropout(output)
+        
+        # print(f"[WaveletPatchEmbedding] 编码-解码对称设计：")
+        # print(f"  输出维度: {output.shape}")
+        # print(f"  频段数: {self.num_bands}, 每频段维度: {self.d_model}")
+        # print(f"  总特征维度: {self.num_bands * self.d_model} (保持频段独立)")
+        # print(f"  ✅ 信息无损传递，与解码端完全对称")
         
         return output, n_vars
 

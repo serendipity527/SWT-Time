@@ -77,9 +77,24 @@ class WaveletHead(nn.Module):
         self.level = level
         self.num_bands = level + 1  # 频段数量
         self.wavelet = wavelet
+        self.d_model = d_model  # 单频段的特征维度
+        self.patch_nums = patch_nums
         
+        # 计算小波滤波器长度（用于边界处理）
+        import pywt
+        try:
+            wavelet_obj = pywt.Wavelet(wavelet)
+            self.filter_len = wavelet_obj.dec_len  # 分解滤波器长度
+        except Exception as e:
+            # 如果pywt不支持该小波，使用默认值
+            self.filter_len = 8  # db4的滤波器长度
+            print(f"⚠️ 无法获取{wavelet}的滤波器长度，使用默认值{self.filter_len}. 错误: {e}")
+        
+        # ===== 编码-解码对称设计 =====
         # 为每个频段创建独立的投影层
-        # 这允许LLM学习不同频段的不同特性（如趋势 vs 细节）
+        # 输入：每个频段独立的 (B, N, d_model, patch_nums)
+        # 输出：每个频段独立的 (B, N, pred_len)
+        # 这与编码端的频段独立处理完全对称
         self.band_projections = nn.ModuleList([
             nn.Sequential(
                 nn.Flatten(start_dim=-2),  # (B, N, d_model, patch_nums) -> (B, N, d_model*patch_nums)
@@ -96,34 +111,100 @@ class WaveletHead(nn.Module):
         print(f"[WaveletHead] 创建小波输出头：{self.num_bands}个频段投影层 + ISWT重构")
         print(f"  - 小波类型: {wavelet}")
         print(f"  - 分解层数: {level}")
+        print(f"  - 滤波器长度: {self.filter_len} (用于边界重构)")
+        print("  - 边界优化: ✅ 历史拼接法 (消除边界伪影)")
+        print(f"  - 输入维度: {self.num_bands}*{d_model}={self.num_bands*d_model} (频段独立)")
+        print("  - 架构设计: ✅ 编码-解码完全对称")
         print(f"  - 每个频段参数量: {d_model * patch_nums * pred_len:,}")
         print(f"  - 总参数量: {d_model * patch_nums * pred_len * self.num_bands:,}")
     
-    def forward(self, x):
+    def forward(self, x, history_coeffs=None):
         """
         Args:
-            x: (B, N, d_model, patch_nums) - LLM隐状态
+            x: (B, N, num_bands*d_model, patch_nums) - LLM隐状态（频段独立）
+               注意：输入维度是 num_bands*d_model，包含所有频段的独立特征
+            history_coeffs: (B, N, T, num_bands) - 历史序列的小波系数（可选）
+                           用于边界重构优化，消除ISWT的边界伪影
         
         Returns:
             pred: (B, N, pred_len) - 预测的时域信号
-        """
-        B, N, d_model, patch_nums = x.shape
         
-        # Step 1: 为每个频段生成预测的小波系数
+        编码-解码对称性：
+            编码端：4频段独立 → 4*d_model维特征
+            解码端：4*d_model维特征 → split回4频段 → 独立预测
+            ✅ 信息流畅无损
+        
+        边界优化原理：
+            ISWT是基于卷积滤波器的重构，在t=0处需要访问历史数据。
+            通过拼接历史小波系数到预测系数前，为滤波器提供完整的边界上下文。
+        """
+        B, N, total_d_model, patch_nums = x.shape
+        
+        # ===== 验证输入维度 =====
+        expected_d_model = self.num_bands * self.d_model
+        if total_d_model != expected_d_model:
+            raise ValueError(
+                f"输入维度不匹配！期望: {expected_d_model} "
+                f"(num_bands={self.num_bands} × d_model={self.d_model}), "
+                f"实际: {total_d_model}"
+            )
+        
+        # ===== Step 1: 分离频段特征（对称解码）=====
+        # 将拼接的特征分离回独立频段
+        # (B, N, num_bands*d_model, patch_nums) 
+        # -> num_bands个(B, N, d_model, patch_nums)
+        x_bands = torch.split(x, self.d_model, dim=2)
+        # 例如：(B, N, 128, patches) -> 4个(B, N, 32, patches)
+        
+        # ===== Step 2: 每个频段独立预测小波系数 =====
         wavelet_coeffs = []
-        for i, proj in enumerate(self.band_projections):
-            # 每个投影层输出该频段的预测系数
-            coeff = proj(x)  # (B, N, pred_len)
+        for i, (proj, x_band) in enumerate(zip(self.band_projections, x_bands)):
+            # 每个投影层处理对应频段的独立特征
+            coeff = proj(x_band)  # (B, N, pred_len)
             wavelet_coeffs.append(coeff)
         
-        # Step 2: Stack到频段维度
+        # ===== Step 3: Stack到频段维度 =====
         # [(B, N, pred_len)] * num_bands -> (B, N, pred_len, num_bands)
         # 顺序: [cA_pred, cD_n_pred, cD_{n-1}_pred, ..., cD_1_pred]
         wavelet_coeffs = torch.stack(wavelet_coeffs, dim=-1)
         
-        # Step 3: ISWT重构回时域
-        # (B, N, pred_len, num_bands) -> (B, N, pred_len)
-        pred = self.iswt(wavelet_coeffs)
+        # 对称性确认：
+        # 编码端输出：(B*N, patches, 4*d_model)  - 4个频段独立
+        # 解码端处理：split成4个频段 → 独立预测 → stack  ✅ 完全对称
+        
+        # ===== Step 4: 边界优化 - 拼接历史小波系数 =====
+        if history_coeffs is not None:
+            # 取历史序列的最后filter_len个点作为边界上下文
+            # 这些点提供了ISWT滤波器在边界处所需的历史信息
+            history_len = history_coeffs.shape[2]
+            if history_len >= self.filter_len:
+                history_suffix = history_coeffs[:, :, -self.filter_len:, :]  
+                # (B, N, filter_len, num_bands)
+            else:
+                # 如果历史长度不足，用全部历史数据
+                history_suffix = history_coeffs
+                print(f"⚠️ 历史长度{history_len}小于滤波器长度{self.filter_len}，使用全部历史数据")
+            
+            # 拼接：[历史尾部 | 预测系数]
+            coeffs_with_context = torch.cat([history_suffix, wavelet_coeffs], dim=2)
+            # (B, N, filter_len + pred_len, num_bands)
+            
+            # ISWT重构（包含边界上下文）
+            pred_with_context = self.iswt(coeffs_with_context)
+            # (B, N, filter_len + pred_len)
+            
+            # 裁剪掉历史部分，只保留预测部分
+            pred = pred_with_context[:, :, history_suffix.shape[2]:]
+            # (B, N, pred_len)
+        else:
+            # 降级方案：如果没有历史数据，直接重构（保持向后兼容）
+            # 注意：这种情况下边界可能存在伪影
+            pred = self.iswt(wavelet_coeffs)
+            # 只在第一次遇到时警告，避免日志刷屏
+            if not hasattr(self, '_warned_no_history'):
+                print("⚠️ [WaveletHead] 未提供历史小波系数，边界可能有伪影")
+                print("   建议：在调用时传递history_coeffs参数以获得最佳性能")
+                self._warned_no_history = True
         
         return pred
 
@@ -277,19 +358,30 @@ class Model(nn.Module):
         
         if use_wavelet:
             # 小波Patch Embedding：先SWT分解，再Patching
+            swt_level = getattr(configs, 'swt_level', 3)
+            num_bands = swt_level + 1  # 频段数量
+            
             self.patch_embedding = WaveletPatchEmbedding(
                 d_model=configs.d_model,
                 patch_len=self.patch_len,
                 stride=self.stride,
                 wavelet=getattr(configs, 'wavelet', 'db4'),  # 默认db4小波
-                level=getattr(configs, 'swt_level', 3),      # 默认3层分解
+                level=swt_level,      # 默认3层分解
                 dropout=configs.dropout
             )
-            print(f"[TimeLLM] 使用 WaveletPatchEmbedding (小波={getattr(configs, 'wavelet', 'db4')}, 层数={getattr(configs, 'swt_level', 3)})")
+            
+            # ===== 关键修复：计算实际的embedding维度 =====
+            # WaveletPatchEmbedding输出: num_bands * d_model (例如：4×32=128)
+            # 而不是原来的 d_model (32)
+            self.patch_embedding_dim = num_bands * configs.d_model
+            
+            print(f"[TimeLLM] 使用 WaveletPatchEmbedding (小波={getattr(configs, 'wavelet', 'db4')}, 层数={swt_level})")
+            print(f"  - Embedding输出维度: {self.patch_embedding_dim} ({num_bands}频段 × {configs.d_model}维)")
         else:
             # 原始Patch Embedding
             self.patch_embedding = PatchEmbedding(
                 configs.d_model, self.patch_len, self.stride, configs.dropout)
+            self.patch_embedding_dim = configs.d_model  # 原始维度
             print("[TimeLLM] 使用 原始 PatchEmbedding")
 
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
@@ -297,7 +389,15 @@ class Model(nn.Module):
         self.num_tokens = 1000
         self.mapping_layer = nn.Linear(self.vocab_size, self.num_tokens)
 
-        self.reprogramming_layer = ReprogrammingLayer(configs.d_model, configs.n_heads, self.d_ff, self.d_llm)
+        # ===== 关键修复：使用正确的embedding维度 =====
+        # ReprogrammingLayer需要匹配patch_embedding的实际输出维度
+        self.reprogramming_layer = ReprogrammingLayer(
+            self.patch_embedding_dim,  # 使用实际维度（可能是128而不是32）
+            configs.n_heads, 
+            d_keys=None,  # 让它自动计算 d_model // n_heads
+            d_llm=self.d_llm
+        )
+        print(f"[TimeLLM] ReprogrammingLayer 输入维度: {self.patch_embedding_dim}")
 
         self.patch_nums = int((configs.seq_len - self.patch_len) / self.stride + 2)
         self.head_nf = self.d_ff * self.patch_nums
@@ -306,28 +406,48 @@ class Model(nn.Module):
             # 可通过配置选择输出头类型
             use_wavelet_head = getattr(configs, 'use_wavelet_head', False)
             
+            # ===== 关键修复：添加 Output Adapter =====
+            # 解决信息瓶颈：使用线性层从d_llm投影到目标维度，而不是直接切片
+            # 这允许模型从冻结的LLM中提取有效信息，并将其组织成所需的格式
+            
             if use_wavelet_head:
                 # 小波系数输出头：对称小波域架构
                 # LLM隐状态 -> 小波系数预测 -> ISWT重构 -> 时域预测
+                
+                # 计算目标维度：所有频段的总维度
+                swt_level = getattr(configs, 'swt_level', 3)
+                num_bands = swt_level + 1
+                self.dec_out_dim = num_bands * configs.d_model
+                
                 self.output_projection = WaveletHead(
                     n_vars=configs.enc_in,
-                    d_model=self.d_ff,
+                    d_model=configs.d_model,  # 使用单频段维度
                     patch_nums=self.patch_nums,
                     pred_len=self.pred_len,
-                    level=getattr(configs, 'swt_level', 3),
+                    level=swt_level,
                     wavelet=getattr(configs, 'wavelet', 'db4'),
                     head_dropout=configs.dropout
                 )
                 print("[TimeLLM] 使用 WaveletHead 输出层")
-                print(f"  - 架构: LLM隐状态 → 小波系数({getattr(configs, 'swt_level', 3)+1}频段) → ISWT重构 → 时域预测")
+                print(f"  - 架构: LLM隐状态 → 小波系数({num_bands}频段) → ISWT重构 → 时域预测")
+                print(f"  - Output Adapter目标维度: {self.dec_out_dim}")
             else:
                 # 原始线性输出头：直接时域映射
                 # LLM隐状态 -> 线性层 -> 时域预测
+                self.dec_out_dim = self.d_ff  # 保持与原始逻辑一致，投影到d_ff
+                
                 self.output_projection = FlattenHead(
                     configs.enc_in, self.head_nf, self.pred_len,
                     head_dropout=configs.dropout
                 )
                 print("[TimeLLM] 使用 FlattenHead 输出层（直接时域映射）")
+                print(f"  - Output Adapter目标维度: {self.dec_out_dim}")
+            
+            # 创建输出适配器：d_llm -> dec_out_dim
+            self.output_adapter = nn.Linear(self.d_llm, self.dec_out_dim)
+            # 初始化适配器权重，使其更易于训练
+            nn.init.xavier_normal_(self.output_adapter.weight)
+            
         else:
             raise NotImplementedError
 
@@ -378,18 +498,50 @@ class Model(nn.Module):
 
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
 
-        x_enc = x_enc.permute(0, 2, 1).contiguous()
+        x_enc = x_enc.permute(0, 2, 1).contiguous()  # (B, N, T)
+        
+        # ===== 边界优化：提取历史小波系数 =====
+        # 如果输出层是WaveletHead，提前对历史序列进行SWT分解
+        # 这些系数将用于ISWT重构时的边界处理，消除边界伪影
+        history_coeffs = None
+        if isinstance(self.output_projection, WaveletHead):
+            # 复用patch_embedding中的SWT模块提取历史序列的小波系数
+            # 注意：这里直接调用swt模块，不经过patching过程
+            if hasattr(self.patch_embedding, 'swt'):
+                history_coeffs = self.patch_embedding.swt(x_enc.to(torch.bfloat16))
+                # history_coeffs: (B, N, T, num_bands)
+                # 这些系数包含了历史序列的多尺度频域信息
+            else:
+                print("⚠️ patch_embedding没有swt属性，无法提取历史小波系数")
+        # =========================================
+        
         enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
-        dec_out = dec_out[:, :, :self.d_ff]
+        
+        # ===== 关键修复：使用Output Adapter =====
+        # 原始代码：dec_out = dec_out[:, :, :self.d_ff] (丢弃了绝大部分信息)
+        # 新代码：投影到目标维度
+        dec_out = self.output_adapter(dec_out)
+        # =====================================
 
         dec_out = torch.reshape(
             dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
 
-        dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
+        # ===== 修改：传递历史系数到WaveletHead =====
+        if isinstance(self.output_projection, WaveletHead):
+            # WaveletHead使用历史系数进行边界优化
+            dec_out = self.output_projection(
+                dec_out[:, :, :, -self.patch_nums:], 
+                history_coeffs=history_coeffs
+            )
+        else:
+            # FlattenHead或其他输出层，保持原有调用方式
+            dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
+        # ============================================
+        
         dec_out = dec_out.permute(0, 2, 1).contiguous()
 
         dec_out = self.normalize_layers(dec_out, 'denorm')
