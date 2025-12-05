@@ -106,12 +106,26 @@ parser.add_argument('--swt_level', type=int, default=3, help='SWT decomposition 
 parser.add_argument('--use_band_attention', type=int, default=1, 
                     help='whether to use learnable band attention weights (0=off, 1=on, default=1)')
 
+# hybrid loss config
+parser.add_argument('--use_hybrid_loss', type=int, default=0, 
+                    help='whether to use hybrid loss (time + frequency domain) (0=off, 1=on, default=0)')
+parser.add_argument('--use_wavelet_loss', type=int, default=0,
+                    help='whether to use wavelet coefficient loss (requires use_wavelet_head=1) (0=off, 1=on, default=0)')
+parser.add_argument('--use_spectral_loss', type=int, default=1,
+                    help='whether to use spectral energy loss (0=off, 1=on, default=1)')
+parser.add_argument('--loss_alpha', type=float, default=1.0, help='weight for time-domain MSE loss (default=1.0)')
+parser.add_argument('--loss_beta', type=float, default=0.5, help='weight for wavelet coefficient loss (default=0.5)')
+parser.add_argument('--loss_gamma', type=float, default=0.3, help='weight for spectral energy loss (default=0.3)')
+
 args = parser.parse_args()
 
 # Convert int flags to boolean
 args.use_wavelet = bool(args.use_wavelet)
 args.use_wavelet_head = bool(args.use_wavelet_head)
 args.use_band_attention = bool(args.use_band_attention)
+args.use_hybrid_loss = bool(args.use_hybrid_loss)
+args.use_wavelet_loss = bool(args.use_wavelet_loss)
+args.use_spectral_loss = bool(args.use_spectral_loss)
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')
 accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], deepspeed_plugin=deepspeed_plugin)
@@ -174,7 +188,29 @@ for ii in range(args.itr):
                                             epochs=args.train_epochs,
                                             max_lr=args.learning_rate)
 
-    criterion = nn.MSELoss()
+    # 损失函数初始化
+    if args.use_hybrid_loss:
+        # 使用混合损失函数（时域 + 频域）
+        from utils.losses import HybridLoss
+        criterion = HybridLoss(
+            use_wavelet_loss=args.use_wavelet_loss,
+            use_spectral_loss=args.use_spectral_loss,
+            alpha=args.loss_alpha,
+            beta=args.loss_beta,
+            gamma=args.loss_gamma,
+            wavelet_level=args.swt_level
+        )
+        accelerator.print(f"\n✅ 使用混合损失函数:")
+        accelerator.print(f"  - 时域MSE: α={args.loss_alpha}")
+        if args.use_wavelet_loss:
+            accelerator.print(f"  - 小波系数损失: β={args.loss_beta}")
+        if args.use_spectral_loss:
+            accelerator.print(f"  - 频谱能量损失: γ={args.loss_gamma}\n")
+    else:
+        # 使用传统MSE损失
+        criterion = nn.MSELoss()
+        accelerator.print("使用传统MSE损失函数")
+    
     mae_metric = nn.L1Loss()
 
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
@@ -186,6 +222,8 @@ for ii in range(args.itr):
     for epoch in range(args.train_epochs):
         iter_count = 0
         train_loss = []
+        # 收集各个损失分量（用于混合损失）
+        train_loss_components = {'time': [], 'wavelet': [], 'spectral': []}
 
         model.train()
         epoch_time = time.time()
@@ -208,30 +246,109 @@ for ii in range(args.itr):
             if args.use_amp:
                 with torch.cuda.amp.autocast():
                     if args.output_attention:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                     f_dim = -1 if args.features == 'MS' else 0
-                    outputs = outputs[:, -args.pred_len:, f_dim:]
+                    
+                    # 处理模型输出（可能包含小波系数）
+                    if isinstance(model_output, tuple):
+                        outputs, pred_coeffs = model_output
+                        outputs = outputs[:, -args.pred_len:, f_dim:]
+                    else:
+                        outputs = model_output[:, -args.pred_len:, f_dim:]
+                        pred_coeffs = None
+                    
                     batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
-                    loss = criterion(outputs, batch_y)
-                    train_loss.append(loss.item())
+                    
+                    # 计算损失
+                    if args.use_hybrid_loss:
+                        # 准备真实标签的小波系数（如果需要）
+                        true_coeffs = None
+                        if args.use_wavelet_loss and pred_coeffs is not None:
+                            # 对真实标签进行SWT分解
+                            from layers.WaveletEmbed import SWTDecomposition
+                            swt = SWTDecomposition(wavelet=args.wavelet, level=args.swt_level).to(accelerator.device)
+                            batch_y_permuted = batch_y.permute(0, 2, 1).contiguous()  # (B, T, N) -> (B, N, T)
+                            true_coeffs = swt(batch_y_permuted)  # (B, N, T, num_bands)
+                            # 关键修复：确保true_coeffs与outputs的dtype一致
+                            true_coeffs = true_coeffs.to(outputs.dtype)
+                        
+                        # dtype一致性检查（调试用）
+                        if pred_coeffs is not None:
+                            pred_coeffs = pred_coeffs.to(outputs.dtype)
+                        # 确保batch_y也与outputs的dtype一致
+                        batch_y = batch_y.to(outputs.dtype)
+                        
+                        loss, loss_dict = criterion(outputs, batch_y, pred_coeffs, true_coeffs)
+                        train_loss.append(loss.item())
+                        # 收集损失分量
+                        train_loss_components['time'].append(loss_dict.get('time', 0))
+                        train_loss_components['wavelet'].append(loss_dict.get('wavelet', 0))
+                        train_loss_components['spectral'].append(loss_dict.get('spectral', 0))
+                    else:
+                        loss = criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
             else:
                 if args.output_attention:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                 else:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if args.features == 'MS' else 0
-                outputs = outputs[:, -args.pred_len:, f_dim:]
+                
+                # 处理模型输出（可能包含小波系数）
+                if isinstance(model_output, tuple):
+                    outputs, pred_coeffs = model_output
+                    outputs = outputs[:, -args.pred_len:, f_dim:]
+                else:
+                    outputs = model_output[:, -args.pred_len:, f_dim:]
+                    pred_coeffs = None
+                
                 batch_y = batch_y[:, -args.pred_len:, f_dim:]
-                loss = criterion(outputs, batch_y)
-                train_loss.append(loss.item())
+                
+                # 计算损失
+                if args.use_hybrid_loss:
+                    # 准备真实标签的小波系数（如果需要）
+                    true_coeffs = None
+                    if args.use_wavelet_loss and pred_coeffs is not None:
+                        # 对真实标签进行SWT分解
+                        from layers.WaveletEmbed import SWTDecomposition
+                        swt = SWTDecomposition(wavelet=args.wavelet, level=args.swt_level).to(accelerator.device)
+                        batch_y_permuted = batch_y.permute(0, 2, 1).contiguous()  # (B, T, N) -> (B, N, T)
+                        true_coeffs = swt(batch_y_permuted)  # (B, N, T, num_bands)
+                        # 关键修复：确保true_coeffs与outputs的dtype一致
+                        true_coeffs = true_coeffs.to(outputs.dtype)
+                    
+                    # dtype一致性检查（调试用）
+                    if pred_coeffs is not None:
+                        pred_coeffs = pred_coeffs.to(outputs.dtype)
+                    # 确保batch_y也与outputs的dtype一致
+                    batch_y = batch_y.to(outputs.dtype)
+                    
+                    loss, loss_dict = criterion(outputs, batch_y, pred_coeffs, true_coeffs)
+                    train_loss.append(loss.item())
+                    # 收集损失分量
+                    train_loss_components['time'].append(loss_dict.get('time', 0))
+                    train_loss_components['wavelet'].append(loss_dict.get('wavelet', 0))
+                    train_loss_components['spectral'].append(loss_dict.get('spectral', 0))
+                else:
+                    loss = criterion(outputs, batch_y)
+                    train_loss.append(loss.item())
 
             if (i + 1) % 100 == 0:
-                accelerator.print(
-                    "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                if args.use_hybrid_loss and 'loss_dict' in locals():
+                    # 打印详细的损失分解
+                    accelerator.print(
+                        "\titers: {0}, epoch: {1} | total: {2:.7f} [time: {3:.4f}, wavelet: {4:.4f}, spectral: {5:.4f}]".format(
+                            i + 1, epoch + 1, loss.item(), 
+                            loss_dict.get('time', 0),
+                            loss_dict.get('wavelet', 0),
+                            loss_dict.get('spectral', 0)))
+                else:
+                    accelerator.print(
+                        "\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                 speed = (time.time() - time_now) / iter_count
                 left_time = speed * ((args.train_epochs - epoch) * train_steps - i)
                 accelerator.print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
@@ -254,9 +371,22 @@ for ii in range(args.itr):
         train_loss = np.average(train_loss)
         vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
         test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
-        accelerator.print(
-            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
-                epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
+        
+        # 打印epoch统计信息
+        if args.use_hybrid_loss and len(train_loss_components['time']) > 0:
+            # 计算各分量的平均值
+            avg_time = np.average(train_loss_components['time'])
+            avg_wavelet = np.average(train_loss_components['wavelet'])
+            avg_spectral = np.average(train_loss_components['spectral'])
+            accelerator.print(
+                "Epoch: {0} | Train Loss: {1:.7f} [time: {2:.4f}, wavelet: {3:.4f}, spectral: {4:.4f}] | "
+                "Vali Loss: {5:.7f} Test Loss: {6:.7f} MAE Loss: {7:.7f}".format(
+                    epoch + 1, train_loss, avg_time, avg_wavelet, avg_spectral,
+                    vali_loss, test_loss, test_mae_loss))
+        else:
+            accelerator.print(
+                "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
+                    epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
 
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:

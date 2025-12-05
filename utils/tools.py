@@ -154,14 +154,21 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
             if args.use_amp:
                 with torch.cuda.amp.autocast():
                     if args.output_attention:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
-                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
             else:
                 if args.output_attention:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                    model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                 else:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    model_output = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+            # 处理模型输出（可能包含小波系数）
+            if isinstance(model_output, tuple):
+                outputs, pred_coeffs = model_output
+            else:
+                outputs = model_output
+                pred_coeffs = None
 
             outputs, batch_y = accelerator.gather_for_metrics((outputs, batch_y))
 
@@ -172,7 +179,24 @@ def vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric
             pred = outputs.detach()
             true = batch_y.detach()
 
-            loss = criterion(pred, true)
+            # 计算损失
+            if hasattr(args, 'use_hybrid_loss') and args.use_hybrid_loss:
+                # 混合损失：需要准备小波系数
+                true_coeffs = None
+                if hasattr(args, 'use_wavelet_loss') and args.use_wavelet_loss and pred_coeffs is not None:
+                    from layers.WaveletEmbed import SWTDecomposition
+                    swt = SWTDecomposition(wavelet=args.wavelet, level=args.swt_level).to(accelerator.device)
+                    true_permuted = true.permute(0, 2, 1).contiguous()
+                    true_coeffs = swt(true_permuted)
+                
+                from utils.losses import HybridLoss
+                if isinstance(criterion, HybridLoss):
+                    loss, _ = criterion(pred, true, pred_coeffs, true_coeffs)
+                else:
+                    loss = criterion(pred, true)
+            else:
+                # 传统MSE损失
+                loss = criterion(pred, true)
 
             mae_loss = mae_metric(pred, true)
 

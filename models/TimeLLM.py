@@ -70,7 +70,8 @@ class WaveletHead(nn.Module):
     """
     
     def __init__(self, n_vars, d_model, patch_nums, pred_len, 
-                 level=3, wavelet='db4', head_dropout=0, use_band_attention=True):
+                 level=3, wavelet='db4', head_dropout=0, use_band_attention=True,
+                 return_coeffs=False):
         super().__init__()
         self.n_vars = n_vars
         self.pred_len = pred_len
@@ -80,6 +81,7 @@ class WaveletHead(nn.Module):
         self.d_model = d_model  # 单频段的特征维度
         self.patch_nums = patch_nums
         self.use_band_attention = use_band_attention  # 是否启用频段注意力
+        self.return_coeffs = return_coeffs  # 是否返回小波系数（用于损失计算）
         
         # 计算小波滤波器长度（用于边界处理）
         import pywt
@@ -173,7 +175,12 @@ class WaveletHead(nn.Module):
                            用于边界重构优化，消除ISWT的边界伪影
         
         Returns:
-            pred: (B, N, pred_len) - 预测的时域信号
+            如果 self.return_coeffs=False（默认）:
+                pred: (B, N, pred_len) - 预测的时域信号
+            如果 self.return_coeffs=True（用于损失计算）:
+                (pred, wavelet_coeffs_weighted): 
+                    - pred: (B, N, pred_len) - 预测的时域信号
+                    - wavelet_coeffs_weighted: (B, N, pred_len, num_bands) - 加权后的小波系数
         
         编码-解码对称性：
             编码端：4频段独立 → 4*d_model维特征
@@ -280,7 +287,13 @@ class WaveletHead(nn.Module):
                 print("   建议：在调用时传递history_coeffs参数以获得最佳性能")
                 self._warned_no_history = True
         
-        return pred
+        # 根据配置返回
+        if self.return_coeffs:
+            # 返回时域预测 + 小波系数（用于损失计算）
+            return pred, wavelet_coeffs_weighted
+        else:
+            # 仅返回时域预测（默认行为）
+            return pred
 
 
 class Model(nn.Module):
@@ -500,6 +513,9 @@ class Model(nn.Module):
                 # 是否启用频段注意力机制（默认启用，与编码端保持一致）
                 use_band_attention = getattr(configs, 'use_band_attention', True)
                 
+                # 是否返回小波系数（用于混合损失函数）
+                return_coeffs = getattr(configs, 'use_wavelet_loss', False)
+                
                 self.output_projection = WaveletHead(
                     n_vars=configs.enc_in,
                     d_model=configs.d_model,  # 使用单频段维度
@@ -508,7 +524,8 @@ class Model(nn.Module):
                     level=swt_level,
                     wavelet=getattr(configs, 'wavelet', 'db4'),
                     head_dropout=configs.dropout,
-                    use_band_attention=use_band_attention  # 频段注意力开关
+                    use_band_attention=use_band_attention,  # 频段注意力开关
+                    return_coeffs=return_coeffs  # 是否返回小波系数
                 )
                 print("[TimeLLM] 使用 WaveletHead 输出层")
                 print(f"  - 架构: LLM隐状态 → 小波系数({num_bands}频段) → ISWT重构 → 时域预测")
@@ -537,8 +554,14 @@ class Model(nn.Module):
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            return dec_out[:, -self.pred_len:, :]
+            output = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+            # 检查是否返回了小波系数
+            if isinstance(output, tuple):
+                dec_out, pred_coeffs = output
+                return dec_out[:, -self.pred_len:, :], pred_coeffs
+            else:
+                dec_out = output
+                return dec_out[:, -self.pred_len:, :]
         return None
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
@@ -612,13 +635,20 @@ class Model(nn.Module):
             dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
 
-        # ===== 修改：传递历史系数到WaveletHead =====
+        # ===== 修改：传递历史系数到WaveletHead + 支持返回小波系数 =====
+        pred_coeffs = None  # 用于存储预测的小波系数
+        
         if isinstance(self.output_projection, WaveletHead):
             # WaveletHead使用历史系数进行边界优化
-            dec_out = self.output_projection(
+            output = self.output_projection(
                 dec_out[:, :, :, -self.patch_nums:], 
                 history_coeffs=history_coeffs
             )
+            # 检查是否返回了小波系数
+            if isinstance(output, tuple):
+                dec_out, pred_coeffs = output  # (B, N, pred_len), (B, N, pred_len, num_bands)
+            else:
+                dec_out = output  # (B, N, pred_len)
         else:
             # FlattenHead或其他输出层，保持原有调用方式
             dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
@@ -628,7 +658,11 @@ class Model(nn.Module):
 
         dec_out = self.normalize_layers(dec_out, 'denorm')
 
-        return dec_out
+        # 如果有小波系数，一起返回
+        if pred_coeffs is not None:
+            return dec_out, pred_coeffs
+        else:
+            return dec_out
 
     def calcute_lags(self, x_enc):
         q_fft = torch.fft.rfft(x_enc.permute(0, 2, 1).contiguous(), dim=-1)
