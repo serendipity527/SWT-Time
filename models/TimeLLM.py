@@ -70,7 +70,7 @@ class WaveletHead(nn.Module):
     """
     
     def __init__(self, n_vars, d_model, patch_nums, pred_len, 
-                 level=3, wavelet='db4', head_dropout=0):
+                 level=3, wavelet='db4', head_dropout=0, use_band_attention=True):
         super().__init__()
         self.n_vars = n_vars
         self.pred_len = pred_len
@@ -79,6 +79,7 @@ class WaveletHead(nn.Module):
         self.wavelet = wavelet
         self.d_model = d_model  # 单频段的特征维度
         self.patch_nums = patch_nums
+        self.use_band_attention = use_band_attention  # 是否启用频段注意力
         
         # 计算小波滤波器长度（用于边界处理）
         import pywt
@@ -108,6 +109,23 @@ class WaveletHead(nn.Module):
         from layers.WaveletEmbed import ISWTReconstruction
         self.iswt = ISWTReconstruction(wavelet=wavelet, level=level)
         
+        # ===== 频段注意力机制（方案2：与编码端对称）=====
+        # 可通过use_band_attention参数控制是否启用
+        if self.use_band_attention:
+            # 为解码端也添加频段重要性建模，与WaveletPatchEmbedding保持一致
+            # 初始化策略：与编码端相同的经验权重
+            initial_weights = torch.tensor([1.5, 0.3, 1.0, 0.8], dtype=torch.float32)
+            self.band_attention_logits = nn.Parameter(
+                torch.log(initial_weights + 1e-8)
+            )
+            
+            # 是否打印权重（调试用）
+            self.print_band_weights = True
+            self._band_weights_printed = False
+        else:
+            # 不使用频段注意力
+            self.band_attention_logits = None
+        
         print(f"[WaveletHead] 创建小波输出头：{self.num_bands}个频段投影层 + ISWT重构")
         print(f"  - 小波类型: {wavelet}")
         print(f"  - 分解层数: {level}")
@@ -115,8 +133,36 @@ class WaveletHead(nn.Module):
         print("  - 边界优化: ✅ 历史拼接法 (消除边界伪影)")
         print(f"  - 输入维度: {self.num_bands}*{d_model}={self.num_bands*d_model} (频段独立)")
         print("  - 架构设计: ✅ 编码-解码完全对称")
+        if self.use_band_attention:
+            print("  - 频段注意力: ✅ 可学习的频段重要性权重")
+        else:
+            print("  - 频段注意力: ⚪ 未启用（所有频段平等对待）")
         print(f"  - 每个频段参数量: {d_model * patch_nums * pred_len:,}")
         print(f"  - 总参数量: {d_model * patch_nums * pred_len * self.num_bands:,}")
+    
+    def get_band_weights(self) -> torch.Tensor:
+        """获取归一化的频段权重（与WaveletPatchEmbedding对称）
+        
+        通过softmax将可学习的logits转换为权重分布。
+        如果未启用频段注意力，返回均匀权重。
+        
+        Returns:
+            weights: (num_bands,) - 归一化的频段权重
+                     顺序: [cA_n, cD_n, cD_{n-1}, ..., cD_1]
+        
+        设计理念：
+            - 与编码端保持一致，增强重要频段、抑制噪声频段
+            - 编码端加权提取特征，解码端加权组合预测
+            - 端到端训练，两端权重协同优化
+        """
+        if self.use_band_attention and self.band_attention_logits is not None:
+            # 启用频段注意力：使用可学习的权重
+            weights = torch.softmax(self.band_attention_logits, dim=0)
+        else:
+            # 未启用：返回均匀权重（所有频段平等对待）
+            device = next(self.parameters()).device
+            weights = torch.ones(self.num_bands, device=device) / self.num_bands
+        return weights
     
     def forward(self, x, history_coeffs=None):
         """
@@ -168,6 +214,32 @@ class WaveletHead(nn.Module):
         # 顺序: [cA_pred, cD_n_pred, cD_{n-1}_pred, ..., cD_1_pred]
         wavelet_coeffs = torch.stack(wavelet_coeffs, dim=-1)
         
+        # ===== Step 3.5: 频段重要性加权（方案2：与编码端对称）=====
+        # 在ISWT重构之前，对预测的小波系数进行加权
+        # 这与编码端的频段加权形成对称设计
+        
+        # 获取可学习的频段权重 (num_bands,) = (4,)
+        band_weights = self.get_band_weights()  # softmax归一化后的权重
+        
+        # 可视化频段权重（仅在第一次调用时打印）
+        if self.use_band_attention and hasattr(self, 'print_band_weights') and \
+           self.print_band_weights and not self._band_weights_printed:
+            band_names = [f"cA{self.level}"] + [f"cD{self.level-i+1}" for i in range(1, self.num_bands)]
+            print(f"\n[WaveletHead] 频段注意力权重:")
+            # 修复：bfloat16不支持numpy，需要先转float32
+            for name, weight in zip(band_names, band_weights.detach().float().cpu().numpy()):
+                print(f"  - {name}: {weight:.4f}")
+            self._band_weights_printed = True
+        
+        # 应用频段权重到小波系数
+        # wavelet_coeffs: (B, N, pred_len, num_bands)
+        # band_weights: (num_bands,)
+        # 广播到 (1, 1, 1, num_bands) 以进行逐频段缩放
+        band_weights_expanded = band_weights.view(1, 1, 1, self.num_bands)
+        wavelet_coeffs_weighted = wavelet_coeffs * band_weights_expanded
+        # (B, N, pred_len, num_bands)
+        # 现在重要频段（如cA3）的系数被放大，噪声频段（如cD3）被抑制
+        
         # 对称性确认：
         # 编码端输出：(B*N, patches, 4*d_model)  - 4个频段独立
         # 解码端处理：split成4个频段 → 独立预测 → stack  ✅ 完全对称
@@ -185,8 +257,9 @@ class WaveletHead(nn.Module):
                 history_suffix = history_coeffs
                 print(f"⚠️ 历史长度{history_len}小于滤波器长度{self.filter_len}，使用全部历史数据")
             
-            # 拼接：[历史尾部 | 预测系数]
-            coeffs_with_context = torch.cat([history_suffix, wavelet_coeffs], dim=2)
+            # 拼接：[历史尾部 | 加权后的预测系数]
+            # 注意：这里使用加权后的系数，保证频段重要性在整个流程中一致
+            coeffs_with_context = torch.cat([history_suffix, wavelet_coeffs_weighted], dim=2)
             # (B, N, filter_len + pred_len, num_bands)
             
             # ISWT重构（包含边界上下文）
@@ -199,7 +272,8 @@ class WaveletHead(nn.Module):
         else:
             # 降级方案：如果没有历史数据，直接重构（保持向后兼容）
             # 注意：这种情况下边界可能存在伪影
-            pred = self.iswt(wavelet_coeffs)
+            # 使用加权后的系数
+            pred = self.iswt(wavelet_coeffs_weighted)
             # 只在第一次遇到时警告，避免日志刷屏
             if not hasattr(self, '_warned_no_history'):
                 print("⚠️ [WaveletHead] 未提供历史小波系数，边界可能有伪影")
@@ -361,13 +435,17 @@ class Model(nn.Module):
             swt_level = getattr(configs, 'swt_level', 3)
             num_bands = swt_level + 1  # 频段数量
             
+            # 是否启用频段注意力机制（默认启用）
+            use_band_attention = getattr(configs, 'use_band_attention', True)
+            
             self.patch_embedding = WaveletPatchEmbedding(
                 d_model=configs.d_model,
                 patch_len=self.patch_len,
                 stride=self.stride,
                 wavelet=getattr(configs, 'wavelet', 'db4'),  # 默认db4小波
                 level=swt_level,      # 默认3层分解
-                dropout=configs.dropout
+                dropout=configs.dropout,
+                use_band_attention=use_band_attention  # 频段注意力开关
             )
             
             # ===== 关键修复：计算实际的embedding维度 =====
@@ -419,6 +497,9 @@ class Model(nn.Module):
                 num_bands = swt_level + 1
                 self.dec_out_dim = num_bands * configs.d_model
                 
+                # 是否启用频段注意力机制（默认启用，与编码端保持一致）
+                use_band_attention = getattr(configs, 'use_band_attention', True)
+                
                 self.output_projection = WaveletHead(
                     n_vars=configs.enc_in,
                     d_model=configs.d_model,  # 使用单频段维度
@@ -426,7 +507,8 @@ class Model(nn.Module):
                     pred_len=self.pred_len,
                     level=swt_level,
                     wavelet=getattr(configs, 'wavelet', 'db4'),
-                    head_dropout=configs.dropout
+                    head_dropout=configs.dropout,
+                    use_band_attention=use_band_attention  # 频段注意力开关
                 )
                 print("[TimeLLM] 使用 WaveletHead 输出层")
                 print(f"  - 架构: LLM隐状态 → 小波系数({num_bands}频段) → ISWT重构 → 时域预测")

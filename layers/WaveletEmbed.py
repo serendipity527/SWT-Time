@@ -499,7 +499,8 @@ class WaveletPatchEmbedding(nn.Module):
                  stride: int,
                  wavelet: str = 'db4',
                  level: int = 3,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 use_band_attention: bool = True):
         super(WaveletPatchEmbedding, self).__init__()
         
         self.d_model = d_model
@@ -507,6 +508,7 @@ class WaveletPatchEmbedding(nn.Module):
         self.stride = stride
         self.level = level
         self.num_bands = level + 1  # 近似系数 + level个细节系数
+        self.use_band_attention = use_band_attention  # 是否启用频段注意力
         
         # 1. SWT分解模块
         self.swt = SWTDecomposition(wavelet=wavelet, level=level)
@@ -537,6 +539,28 @@ class WaveletPatchEmbedding(nn.Module):
         # 4. Dropout
         self.dropout = nn.Dropout(dropout)
         
+        # 5. 频段注意力机制（方案2：可学习的全局频段注意力）
+        # 可通过use_band_attention参数控制是否启用
+        if self.use_band_attention:
+            # 为每个频段学习一个重要性权重，训练过程中自动优化
+            # 初始化策略：基于领域知识设置初始值
+            # cA3(趋势)=1.5, cD3(高频噪声)=0.3, cD2(中频)=1.0, cD1(低频细节)=0.8
+            initial_weights = torch.tensor([1.5, 0.3, 1.0, 0.8], dtype=torch.float32)
+            # 使用log值初始化，保证softmax后接近期望权重
+            self.band_attention_logits = nn.Parameter(
+                torch.log(initial_weights + 1e-8)  # 避免log(0)
+            )
+            
+            # 是否在训练过程中打印频段权重（用于调试和分析）
+            self.print_band_weights = True
+            self._band_weights_printed = False  # 避免重复打印
+            
+            print("[WaveletPatchEmbedding] ✅ 频段注意力机制已启用")
+        else:
+            # 不使用频段注意力，所有频段平等对待
+            self.band_attention_logits = None
+            print("[WaveletPatchEmbedding] ⚪ 频段注意力机制未启用（所有频段平等对待）")
+        
         # 参数验证
         self._validate_params()
     
@@ -553,6 +577,30 @@ class WaveletPatchEmbedding(nn.Module):
                 f"patch_len ({self.patch_len}) 小于SWT最小长度 ({min_seq_len}), "
                 f"可能导致边界效应"
             )
+    
+    def get_band_weights(self) -> torch.Tensor:
+        """获取归一化的频段权重
+        
+        通过softmax将可学习的logits转换为权重分布，保证所有权重和为1。
+        如果未启用频段注意力，返回均匀权重。
+        
+        Returns:
+            weights: (num_bands,) - 归一化的频段权重
+                     顺序: [cA_n, cD_n, cD_{n-1}, ..., cD_1]
+        
+        权重解释：
+            - 权重越大，该频段在特征表示中的贡献越大
+            - softmax保证了权重的归一化和可微性
+            - 训练过程中权重会自动调整以优化预测性能
+        """
+        if self.use_band_attention and self.band_attention_logits is not None:
+            # 启用频段注意力：使用可学习的权重
+            weights = torch.softmax(self.band_attention_logits, dim=0)
+        else:
+            # 未启用：返回均匀权重（所有频段平等对待）
+            device = next(self.parameters()).device
+            weights = torch.ones(self.num_bands, device=device) / self.num_bands
+        return weights
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
@@ -640,26 +688,56 @@ class WaveletPatchEmbedding(nn.Module):
             B, N, self.num_bands, num_patches, self.d_model
         )
         
-        # ===== Step 8: 频段独立性保持（编码-解码对称优化）=====
-        # ⚠️ 关键改动：不再使用简单平均融合！
+        # ===== Step 8: 频段重要性加权（方案2：可学习的全局频段注意力）=====
+        # 在频段独立性保持的基础上，添加频段重要性建模
+        # 不同频段对预测的贡献不同：
+        #   - cA3 (低频趋势): 通常最重要，包含主要预测信号
+        #   - cD3 (高频噪声): 贡献较小，多为噪声
+        #   - cD2 (中频波动): 次重要，包含周期模式
+        #   - cD1 (低频细节): 中等重要，长期模式
+        
+        # 获取可学习的频段权重 (num_bands,) = (4,)
+        band_weights = self.get_band_weights()  # softmax归一化后的权重
+        
+        # 可视化频段权重（仅在训练开始时打印一次，用于调试）
+        if self.use_band_attention and hasattr(self, 'print_band_weights') and \
+           self.print_band_weights and not self._band_weights_printed:
+            band_names = [f"cA{self.level}"] + [f"cD{self.level-i+1}" for i in range(1, self.num_bands)]
+            print(f"\n[WaveletPatchEmbedding] 频段注意力权重:")
+            # 修复：bfloat16不支持numpy，需要先转float32
+            for name, weight in zip(band_names, band_weights.detach().float().cpu().numpy()):
+                print(f"  - {name}: {weight:.4f}")
+            self._band_weights_printed = True
+        
+        # 应用频段权重到特征
+        # x_reshaped: (B, N, num_bands, num_patches, d_model)
+        # band_weights: (num_bands,)
+        # 广播到 (1, 1, num_bands, 1, 1) 以进行逐频段缩放
+        band_weights_expanded = band_weights.view(1, 1, self.num_bands, 1, 1)
+        x_weighted = x_reshaped * band_weights_expanded
+        # (B, N, num_bands, num_patches, d_model)
+        # 现在每个频段的特征都按其重要性进行了缩放
+        
+        # ===== Step 8.5: 频段独立性保持（编码-解码对称优化）=====
         # 原方案（不对称）：
         #   编码：4频段 → mean融合 → 1混合向量
         #   解码：1混合向量 → 分离 → 4频段  ❌ 信息瓶颈
         #
-        # 新方案（对称）：
-        #   编码：4频段 → 保持独立 → 4频段特征
-        #   解码：4频段特征 → 独立预测 → 4频段  ✅ 信息无损
+        # 新方案（对称 + 加权）：
+        #   编码：4频段 → 加权 → 保持独立 → 4频段特征
+        #   解码：4频段特征 → 独立预测 → 加权 → 4频段  ✅ 信息无损 + 重要性建模
         #
         # (B, N, num_bands, num_patches, d_model)
         # -> (B, N, num_patches, num_bands*d_model)
         # 将频段维度展平到特征维度，而不是平均掉
-        x_multiband = x_reshaped.permute(0, 1, 3, 2, 4).contiguous()
+        x_multiband = x_weighted.permute(0, 1, 3, 2, 4).contiguous()
         # (B, N, num_patches, num_bands, d_model)
         
         x_multiband = x_multiband.reshape(
             B, N, num_patches, self.num_bands * self.d_model
         )
         # (B, N, num_patches, 4*d_model)  例如：4*32=128维
+        # 现在这128维中，重要频段的32维具有更大的数值，信息更显著
         
         # ===== Step 9: 最终reshape =====
         # (B, N, num_patches, num_bands*d_model) 
@@ -669,11 +747,13 @@ class WaveletPatchEmbedding(nn.Module):
         # ===== Step 10: Dropout =====
         output = self.dropout(output)
         
-        # print(f"[WaveletPatchEmbedding] 编码-解码对称设计：")
+        # 调试信息（注释掉以避免日志刷屏，调试时可启用）
+        # print(f"[WaveletPatchEmbedding] 编码-解码对称设计 + 频段注意力：")
         # print(f"  输出维度: {output.shape}")
         # print(f"  频段数: {self.num_bands}, 每频段维度: {self.d_model}")
-        # print(f"  总特征维度: {self.num_bands * self.d_model} (保持频段独立)")
-        # print(f"  ✅ 信息无损传递，与解码端完全对称")
+        # print(f"  总特征维度: {self.num_bands * self.d_model} (保持频段独立 + 加权)")
+        # print(f"  频段权重: {band_weights.detach().cpu().numpy()}")
+        # print(f"  ✅ 信息无损传递 + 重要性建模，与解码端完全对称")
         
         return output, n_vars
 
